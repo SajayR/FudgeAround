@@ -1,28 +1,28 @@
 experiment:
-  name: dinov2-commutator-16
-  name_suffix: rank-16-noskew-gainenabled-skew
+  name: dinov2-relora
+  name_suffix: relora-r2
   seed: 42
   device: auto
   output_dir: ./runs
 
 model:
-  name: dinov2_commutator
+  name: dinov2_relora
   params:
     model_name: facebook/dinov2-small
-    dropout: 0.1
-    freeze_backbone: true
-    commutator:
-      enabled: true
-      r: 16
-      alpha: 32
-      dropout: 0.0
-      skew: true
-      target_modules: ["query", "key", "value", "dense"]
-      init_std_scale: 1.0
-      gain:
-        enabled: true
-        mode: per_out
-        n_heads: null
+    dropout: 0.0
+    relora:
+      r: 2
+      alpha: 4
+      dropout: 0.01
+      target_modules: ["query", "key", "value", "dense", "fc1", "fc2"]
+      merge_interval: 200
+      warm_start_steps: 0
+      adapter_warmup_steps: 50
+      freeze_base: true
+      prune_b_state: true
+    relora_optimizer:
+      lr: 3.0e-4
+      weight_decay: 0.0
 
 training:
   epochs: 4
@@ -38,7 +38,7 @@ training:
   optimizer:
     type: adamw
     lr: 0.0003
-    weight_decay: 0.01
+    weight_decay: 0.0
     betas: [0.9, 0.999]
     eps: 0.00000001
   scheduler:
@@ -48,7 +48,7 @@ training:
   monitor:
     grad_norm: true
     param_norm: true
-    memory: false
+    memory: true
 
 data:
   root: /speedy/datasets
@@ -63,20 +63,14 @@ data:
 
 logging:
   use_wandb: true
-  project: fisher-lora
+  project: fisher-relora
   entity: null
   run_name: null
   group: null
-  tags: ["dinov2", "commutator", "16"]
+  tags: ["dinov2", "relora"]
   notes: null
 
 datasets:
   - name: ImageNet
-    val_split: test
-    normalization: dinov2
-  - name: cifar-10
-    val_split: test
-    normalization: dinov2
-  - name: cifar-100
     val_split: test
     normalization: dinov2

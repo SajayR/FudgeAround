@@ -6,7 +6,7 @@ import logging
 import math
 import random
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -39,8 +39,26 @@ def set_seed(seed: int) -> None:
     LOGGER.info("Seed set to %d", seed)
 
 
-def create_optimizer(model: torch.nn.Module, cfg: Dict[str, Any]) -> torch.optim.Optimizer:
-    params = [p for p in model.parameters() if p.requires_grad]
+def create_optimizer(
+    model: torch.nn.Module,
+    cfg: Dict[str, Any],
+    param_groups: Optional[List[Dict[str, Any]]] = None,
+) -> torch.optim.Optimizer:
+    prepared_groups: List[Dict[str, Any]] = []
+    if param_groups:
+        for group in param_groups:
+            group_copy = dict(group)
+            group_params = [p for p in group_copy.get("params", []) if p.requires_grad]
+            if not group_params:
+                continue
+            group_copy["params"] = group_params
+            prepared_groups.append(group_copy)
+    if prepared_groups:
+        params = prepared_groups
+        num_trainable = sum(p.numel() for group in prepared_groups for p in group["params"])
+    else:
+        params = [p for p in model.parameters() if p.requires_grad]
+        num_trainable = sum(p.numel() for p in params)
     name = cfg.get("type", "adamw").lower()
     lr = float(cfg.get("lr", cfg.get("learning_rate", 3e-4)))
     weight_decay = float(cfg.get("weight_decay", 0.0))
@@ -59,7 +77,13 @@ def create_optimizer(model: torch.nn.Module, cfg: Dict[str, Any]) -> torch.optim
     else:
         raise ValueError(f"Unsupported optimizer: {name}")
 
-    LOGGER.info("Optimizer: %s lr=%.2e weight_decay=%.2e params=%d", name, lr, weight_decay, sum(p.numel() for p in params))
+    LOGGER.info(
+        "Optimizer: %s lr=%.2e weight_decay=%.2e params=%d",
+        name,
+        lr,
+        weight_decay,
+        num_trainable,
+    )
     return optimizer
 
 

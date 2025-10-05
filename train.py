@@ -249,6 +249,7 @@ def train_epoch(
     global_step: int,
     log_every: int,
     logger: RunLogger,
+    relora_controller=None,
 ) -> Dict[str, float]:
     model.train()
     criterion = nn.CrossEntropyLoss()
@@ -266,7 +267,11 @@ def train_epoch(
     progress = tqdm(loader, desc=f"Train {epoch + 1}/{epochs}")
     optimizer.zero_grad(set_to_none=True)
 
+    relora_mgr = relora_controller
+
     for step, (images, targets) in enumerate(progress):
+        if relora_mgr is not None:
+            relora_mgr.on_batch_start(global_step)
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
@@ -297,6 +302,8 @@ def train_epoch(
                 scheduler.step()
 
             global_step += 1
+            if relora_mgr is not None:
+                relora_mgr.on_step_end(global_step)
 
             metrics = {
                 "train/loss": float(loss.item() * grad_accum),
@@ -442,11 +449,18 @@ def run_dataset(
         model, model_meta = create_model(model_name, model_params, dataset_info)
         model.to(device)
 
-        optimizer = create_optimizer(model, training_cfg.get("optimizer", {}))
+        optimizer_groups = model_meta.get("optimizer_param_groups")
+        optimizer = create_optimizer(
+            model, training_cfg.get("optimizer", {}), optimizer_groups
+        )
         total_steps = len(train_loader) * max(int(training_cfg.get("epochs", 1)), 1)
         scheduler = create_scheduler(
             optimizer, training_cfg.get("scheduler", {}), total_steps
         )
+
+        relora_controller = getattr(model, "relora_controller", None)
+        if relora_controller is not None:
+            relora_controller.attach_optimizer(optimizer, scheduler)
 
         precision_cfg = training_cfg.get(
             "precision", {"enabled": True, "dtype": "bf16", "grad_scaler": False}
@@ -490,6 +504,7 @@ def run_dataset(
                 global_step,
                 log_every,
                 run_logger,
+                relora_controller=relora_controller,
             )
             global_step = int(epoch_metrics["state/global_step"])
 

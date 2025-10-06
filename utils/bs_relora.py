@@ -168,7 +168,11 @@ class _Adapter(nn.Module):
         self.active: bool = False
 
     def activate(self, rank: int, device: torch.device, dtype: torch.dtype) -> None:
-        self.core_L = nn.Parameter(torch.zeros(rank, rank, device=device, dtype=dtype))
+        # Initialise to a non-degenerate state so gradients propagate on the
+        # very first low-rank step. Identity for ``L`` preserves the neutral
+        # merge while allowing ``R`` to receive signal immediately.
+        eye = torch.eye(rank, device=device, dtype=dtype)
+        self.core_L = nn.Parameter(eye.clone())
         self.core_R = nn.Parameter(torch.zeros(rank, rank, device=device, dtype=dtype))
         self.active = True
 

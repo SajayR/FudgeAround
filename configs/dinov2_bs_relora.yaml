@@ -14,11 +14,11 @@ model:
         gradient_checkpointing: false
 
 training:
-    epochs: 1
+    epochs: 5
     gradient_clip_norm: 1.0
     grad_accumulation: 1
-    log_every: 20
-    eval_every: 1
+    log_every: 1
+    eval_every: 2
     save_every: 1
     bs_relora:
         enabled: true
@@ -26,7 +26,7 @@ training:
         oversample: 4 # randomized SVD oversampling p
         power_iterations: 1 # power iterations for SVD refinement
         probe_steps: 32 # number of full batches in probe mode
-        low_rank_steps: 512 # batches spent in low-rank phase
+        low_rank_steps: 2048 # batches spent in low-rank phase
         cycles: 30 # repeat count for the schedule
         lambda_u: 0.5 # soft deflation strength (left span)
         lambda_v: 0.5 # soft deflation strength (right span)
@@ -66,11 +66,11 @@ training:
 data:
     root: /speedy/datasets
     image_size: 224
-    batch_size: 64
+    batch_size: 160
     num_workers: 8
     pin_memory: true
     persistent_workers: true
-    normalization: imagenet
+    normalization: dinov2
     augment: true
     drop_last: true
 

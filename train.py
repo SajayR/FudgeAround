@@ -6,11 +6,12 @@ import argparse
 import itertools
 import json
 import logging
+import math
 import re
 import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List
 
 import torch
 import torch.nn as nn
@@ -408,6 +409,101 @@ def _select_bs_relora_layers(model: nn.Module, keywords: Iterable[str]) -> List[
     return matches
 
 
+def _param_matches_prefix(param_name: str, prefix: str) -> bool:
+    prefix = prefix.strip()
+    if not prefix:
+        return False
+    if prefix.endswith("."):
+        return param_name.startswith(prefix)
+    return param_name == prefix or param_name.startswith(prefix + ".")
+
+
+def _freeze_model_except(model: nn.Module, allow_prefixes: Iterable[str]) -> Dict[str, bool]:
+    prefixes = [str(p).strip() for p in (allow_prefixes or []) if str(p).strip()]
+    state: Dict[str, bool] = {}
+    for name, param in model.named_parameters():
+        keep = "_bs_relora_adapter" in name or any(
+            _param_matches_prefix(name, prefix) for prefix in prefixes
+        )
+        state[name] = param.requires_grad
+        param.requires_grad_(keep)
+    return state
+
+
+def _restore_requires_grad_state(model: nn.Module, state: Dict[str, bool]) -> None:
+    for name, param in model.named_parameters():
+        if name in state:
+            param.requires_grad_(state[name])
+
+
+def _resolve_cycle_counts(
+    steps_per_epoch: int | None,
+    grad_accum: int,
+    epochs: int,
+    probe_steps: int,
+    low_rank_steps: int,
+    cycles_cfg: Any,
+) -> tuple[int, Dict[str, Any]]:
+    """Resolve the total BS-ReLoRA cycles to run.
+
+    Args:
+        steps_per_epoch: Number of batches per epoch emitted by the dataloader.
+            ``None`` if the loader does not expose a length.
+        grad_accum: Gradient accumulation factor (>= 1).
+        epochs: Planned number of epochs (>= 1).
+        probe_steps: Probe phase optimiser steps per cycle (>= 1).
+        low_rank_steps: Low-rank phase optimiser steps per cycle (>= 1).
+        cycles_cfg: User provided cycles configuration. ``None`` or ``"auto"``
+            triggers automatic inference.
+
+    Returns:
+        ``(cycles, info)`` where ``cycles`` is the total number of cycles to
+        execute and ``info`` contains diagnostic metadata.
+    """
+
+    grad_accum = max(1, int(grad_accum))
+    epochs = max(1, int(epochs))
+    steps_per_cycle = probe_steps + low_rank_steps
+    if steps_per_cycle <= 0:
+        raise ValueError("probe_steps + low_rank_steps must be positive")
+
+    auto = cycles_cfg is None or (
+        isinstance(cycles_cfg, str) and cycles_cfg.lower() == "auto"
+    )
+
+    info: Dict[str, Any] = {
+        "auto": auto,
+        "steps_per_cycle": steps_per_cycle,
+        "cycles_per_epoch": None,
+        "optimizer_steps_per_epoch": None,
+    }
+
+    if not auto:
+        try:
+            cycles = int(cycles_cfg)
+        except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
+            raise ValueError("cycles must be an integer or 'auto'") from exc
+        if cycles <= 0:
+            raise ValueError("cycles must be positive when provided explicitly")
+        return cycles, info
+
+    if steps_per_epoch is None:
+        raise ValueError(
+            "Automatic BS-ReLoRA cycle inference requires the dataloader to expose a finite length."
+        )
+
+    optimizer_steps_per_epoch = math.ceil(steps_per_epoch / grad_accum)
+    if optimizer_steps_per_epoch <= 0:
+        raise ValueError("Dataset must yield at least one batch per epoch")
+
+    cycles_per_epoch = max(1, math.ceil(optimizer_steps_per_epoch / steps_per_cycle))
+    cycles = cycles_per_epoch * epochs
+
+    info["cycles_per_epoch"] = cycles_per_epoch
+    info["optimizer_steps_per_epoch"] = optimizer_steps_per_epoch
+    return cycles, info
+
+
 def _create_low_rank_optimizer(params: List[nn.Parameter], cfg: Dict[str, any]):
     parameters = [p for p in params if p.requires_grad]
     if not parameters:
@@ -499,8 +595,16 @@ def _run_bs_relora_phase(
         if capture_probe:
             controller.prepare_step()
 
+        step_base = capture_probe
+        if not step_base:
+            for group in base_optimizer.param_groups:
+                if any(p.grad is not None for p in group["params"]):
+                    step_base = True
+                    break
+
         if scaler.is_enabled():
-            scaler.unscale_(base_optimizer)
+            if step_base:
+                scaler.unscale_(base_optimizer)
             if low_rank_optimizer is not None:
                 scaler.unscale_(low_rank_optimizer)
 
@@ -518,24 +622,24 @@ def _run_bs_relora_phase(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
         if scaler.is_enabled():
-            if capture_probe:
+            if step_base:
                 scaler.step(base_optimizer)
             if low_rank_optimizer is not None:
                 scaler.step(low_rank_optimizer)
             scaler.update()
         else:
-            if capture_probe:
+            if step_base:
                 base_optimizer.step()
             if low_rank_optimizer is not None:
                 low_rank_optimizer.step()
 
         if capture_probe:
-            controller.finish_step(capture=True)
+            controller.finish_step(capture=True, optimizer=base_optimizer)
 
         base_optimizer.zero_grad(set_to_none=True)
         if low_rank_optimizer is not None:
             low_rank_optimizer.zero_grad(set_to_none=True)
-        if scheduler is not None and capture_probe:
+        if scheduler is not None and not capture_probe:
             scheduler.step()
 
         global_step += 1
@@ -601,9 +705,51 @@ def _train_with_bs_relora(
         ),
     )
     log_every = int(training_cfg.get("log_every", 10))
-    cycles = max(1, int(bs_cfg.get("cycles", 1)))
     probe_steps = max(1, int(bs_cfg.get("probe_steps", 32)))
     low_rank_steps = max(1, int(bs_cfg.get("low_rank_steps", 128)))
+    epochs_cfg = max(1, int(training_cfg.get("epochs", 1)))
+
+    steps_per_epoch: int | None
+    try:
+        steps_per_epoch = len(train_loader)
+    except TypeError:  # pragma: no cover - support iterable-only loaders
+        steps_per_epoch = None
+
+    precomputed_info = bs_cfg.get("_cycles_info")
+    precomputed_cycles = bs_cfg.get("_cycles_resolved")
+    if precomputed_info is not None and precomputed_cycles is not None:
+        cycles = int(precomputed_cycles)
+        cycles_info = precomputed_info
+    else:
+        cycles, cycles_info = _resolve_cycle_counts(
+            steps_per_epoch=steps_per_epoch,
+            grad_accum=grad_accum,
+            epochs=epochs_cfg,
+            probe_steps=probe_steps,
+            low_rank_steps=low_rank_steps,
+            cycles_cfg=bs_cfg.get("cycles"),
+        )
+        bs_cfg["_cycles_info"] = cycles_info
+        bs_cfg["_cycles_resolved"] = cycles
+
+    if cycles_info.get("auto"):
+        LOGGER.info(
+            (
+                "Auto-inferred %d BS-ReLoRA cycles (%d per epoch) from %d "
+                "optimizer steps/epoch | probe=%d, low_rank=%d, grad_accum=%d, epochs=%d"
+            ),
+            cycles,
+            cycles_info.get("cycles_per_epoch"),
+            cycles_info.get("optimizer_steps_per_epoch"),
+            probe_steps,
+            low_rank_steps,
+            grad_accum,
+            epochs_cfg,
+        )
+    else:
+        LOGGER.info("Using %d BS-ReLoRA cycles (manual)", cycles)
+
+    cycles = max(1, int(cycles))
     eval_every = int(bs_cfg.get("eval_every", training_cfg.get("eval_every", 1)))
     save_every = int(bs_cfg.get("save_every", training_cfg.get("save_every", 1)))
 
@@ -615,6 +761,12 @@ def _train_with_bs_relora(
             "BS-ReLoRA is enabled but no target nn.Linear modules were located. "
             "Provide `training.bs_relora.target_modules` or ensure the model exposes linear layers."
         )
+
+    trainable_prefixes_cfg = bs_cfg.get("trainable_modules", ["head"])
+    if isinstance(trainable_prefixes_cfg, str):
+        trainable_prefixes = [trainable_prefixes_cfg]
+    else:
+        trainable_prefixes = list(trainable_prefixes_cfg or [])
 
     rank_default = lora_defaults.get("r") or lora_defaults.get("rank") or 16
     rank = int(bs_cfg.get("rank", bs_cfg.get("r", rank_default)))
@@ -691,6 +843,7 @@ def _train_with_bs_relora(
         controller.finish_probe()
         controller.extract_subspaces()
         controller.activate_low_rank()
+        freeze_state = _freeze_model_except(model, trainable_prefixes)
         controller.set_base_trainable(False)
 
         low_rank_optimizer = _create_low_rank_optimizer(controller.adapter_parameters(), low_rank_opt_cfg)
@@ -717,6 +870,8 @@ def _train_with_bs_relora(
         )
 
         merge_metrics = controller.merge_and_damp(optimizer)
+        if freeze_state:
+            _restore_requires_grad_state(model, freeze_state)
         controller.restore_original_requires_grad()
         controller.deactivate_low_rank()
 
@@ -785,6 +940,9 @@ def _train_with_bs_relora(
         "dataset/val_samples": dataset_info.val_samples,
         "dataset/classes": dataset_info.num_classes,
     }
+    if cycles_info.get("cycles_per_epoch") is not None:
+        summary["cycles_per_epoch"] = cycles_info["cycles_per_epoch"]
+    summary["cycles_auto"] = bool(cycles_info.get("auto"))
     if best_path is not None:
         summary["best_checkpoint"] = str(best_path)
     return summary
@@ -845,15 +1003,43 @@ def run_dataset(
         model.to(device)
 
         optimizer = create_optimizer(model, training_cfg.get("optimizer", {}))
-        bs_cfg = training_cfg.get("bs_relora", {}) or {}
+        epochs = max(1, int(training_cfg.get("epochs", 1)))
+        grad_accum = max(
+            1,
+            int(
+                training_cfg.get("grad_accumulation", training_cfg.get("grad_accum", 1))
+            ),
+        )
+
+        bs_cfg = deepcopy(training_cfg.get("bs_relora", {}) or {})
         bs_enabled = bool(bs_cfg.get("enabled", False))
+
+        steps_per_epoch: int | None
+        try:
+            steps_per_epoch = len(train_loader)
+        except TypeError:  # pragma: no cover - iterable-only loader
+            steps_per_epoch = None
+
         if bs_enabled:
             probe_steps_conf = max(1, int(bs_cfg.get("probe_steps", 32)))
             low_rank_steps_conf = max(1, int(bs_cfg.get("low_rank_steps", 128)))
-            cycles_conf = max(1, int(bs_cfg.get("cycles", 1)))
-            total_steps = max(1, cycles_conf * (probe_steps_conf + low_rank_steps_conf))
+            cycles_resolved, cycles_info = _resolve_cycle_counts(
+                steps_per_epoch=steps_per_epoch,
+                grad_accum=grad_accum,
+                epochs=epochs,
+                probe_steps=probe_steps_conf,
+                low_rank_steps=low_rank_steps_conf,
+                cycles_cfg=bs_cfg.get("cycles"),
+            )
+            total_steps = max(1, cycles_resolved * (probe_steps_conf + low_rank_steps_conf))
+            bs_cfg["_cycles_resolved"] = cycles_resolved
+            bs_cfg["_cycles_info"] = cycles_info
         else:
-            total_steps = len(train_loader) * max(int(training_cfg.get("epochs", 1)), 1)
+            if steps_per_epoch is None:
+                raise ValueError(
+                    "Non-BS-ReLoRA training requires the dataloader to expose a finite length"
+                )
+            total_steps = steps_per_epoch * epochs
 
         scheduler = create_scheduler(
             optimizer, training_cfg.get("scheduler", {}), total_steps
@@ -863,12 +1049,6 @@ def run_dataset(
             "precision", {"enabled": True, "dtype": "bf16", "grad_scaler": False}
         )
         precision_cfg.setdefault("grad_clip", training_cfg.get("gradient_clip_norm"))
-        grad_accum = max(
-            1,
-            int(
-                training_cfg.get("grad_accumulation", training_cfg.get("grad_accum", 1))
-            ),
-        )
         scaler = GradScaler(
             enabled=precision_cfg.get("enabled", True)
             and device.type == "cuda"
@@ -904,7 +1084,6 @@ def run_dataset(
         best_path = None
         global_step = 0
 
-        epochs = int(training_cfg.get("epochs", 1))
         log_every = int(training_cfg.get("log_every", 10))
         eval_every = int(training_cfg.get("eval_every", 1))
         save_every = int(training_cfg.get("save_every", 1))

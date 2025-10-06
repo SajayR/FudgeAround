@@ -27,7 +27,8 @@ training:
         power_iterations: 1 # power iterations for SVD refinement
         probe_steps: 32 # number of full batches in probe mode
         low_rank_steps: 2048 # batches spent in low-rank phase
-        cycles: 30 # repeat count for the schedule
+        cycles: auto # infer repeats per epoch from probe/low-rank steps
+        trainable_modules: ["head"] # modules kept trainable during low-rank bursts
         lambda_u: 0.5 # soft deflation strength (left span)
         lambda_v: 0.5 # soft deflation strength (right span)
         gamma: 0.5 # momentum damping along new subspace
@@ -66,7 +67,7 @@ training:
 data:
     root: /speedy/datasets
     image_size: 224
-    batch_size: 160
+    batch_size: 196
     num_workers: 8
     pin_memory: true
     persistent_workers: true

@@ -85,9 +85,22 @@ training:
     oversample: 4
     probe_steps: 32
     low_rank_steps: 128
-    cycles: 3
+    cycles: auto
+    trainable_modules: ["head"]
     target_modules: ["query", "key", "value", "dense"]
 ```
+
+With `cycles: auto` (the default), the trainer estimates how many
+probe+low-rank bundles fit into an epoch by looking at the dataloader
+length, your gradient-accumulation factor, and the chosen probe/low-rank
+step counts. The total number of cycles becomes
+``epochs × ceil(optimizer_steps_per_epoch / (probe_steps + low_rank_steps))``.
+Set an explicit integer if you need a fixed count instead.
+
+`trainable_modules` is a small allowlist (module-name prefixes) that stays
+trainable during the low-rank burst. By default only the classifier head is
+updated while everything else—including the frozen base linear weights—is kept
+static.
 
 Set `enabled: false` to fall back to classic epoch-based training.
 

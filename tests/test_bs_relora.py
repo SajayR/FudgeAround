@@ -125,7 +125,7 @@ def test_probe_accumulates_step_and_restores_weight():
 
     controller.prepare_step()
     optimizer.step()
-    controller.finish_step(capture=True)
+    controller.finish_step(capture=True, optimizer=optimizer)
     optimizer.zero_grad()
 
     controller.finish_probe()
@@ -134,3 +134,15 @@ def test_probe_accumulates_step_and_restores_weight():
     assert torch.allclose(linear.weight, torch.eye(2), atol=1e-6)
     assert layer.probe_steps == 1
     assert torch.allclose(layer.avg_step, layer.probe_accum)
+
+    state = optimizer.state[linear.weight]
+    group = optimizer.param_groups[0]
+    step_val = int(state["step"])
+    beta1, beta2 = group["betas"]
+    bias_correction1 = 1 - beta1 ** step_val
+    bias_correction2 = 1 - beta2 ** step_val
+    m_hat = state["exp_avg"] / bias_correction1
+    v_hat = state["exp_avg_sq"] / bias_correction2
+    expected_step = group["lr"] * (m_hat / (v_hat.sqrt() + group["eps"]))
+
+    assert torch.allclose(layer.avg_step, expected_step.to(layer.avg_step.dtype))

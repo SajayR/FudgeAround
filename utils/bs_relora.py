@@ -200,6 +200,7 @@ class BSReLoRALayerState:
     def __post_init__(self) -> None:
         weight = self.module.weight
         self.out_features, self.in_features = weight.shape
+        self.param: nn.Parameter = self.module.weight
         self.snapshot: Optional[Tensor] = None
         self.probe_accum = torch.zeros_like(weight, dtype=torch.float32, device=self.device)
         self.probe_steps: int = 0
@@ -225,13 +226,19 @@ class BSReLoRALayerState:
     def store_snapshot(self) -> None:
         self.snapshot = self.module.weight.detach().clone()
 
-    def restore_and_accumulate(self, capture: bool) -> None:
+    def restore_and_accumulate(
+        self,
+        capture: bool,
+        optimizer: Optional[torch.optim.Optimizer],
+    ) -> None:
         if self.snapshot is None:
             raise RuntimeError("store_snapshot must be called before restore_and_accumulate")
         weight = self.module.weight
-        delta = weight.detach() - self.snapshot
         if capture:
-            self.probe_accum.add_(-delta.to(self.probe_accum.dtype))
+            if optimizer is None:
+                raise ValueError("optimizer is required to capture Adam steps")
+            step = self._adam_preconditioned_step(optimizer)
+            self.probe_accum.add_(step)
             self.probe_steps += 1
         weight.data.copy_(self.snapshot)
         self.snapshot = None
@@ -347,7 +354,8 @@ class BSReLoRALayerState:
                 proj = self._project_onto_span(exp_avg)
                 exp_avg.sub_(gamma * proj)
         if exp_avg_sq is not None:
-            exp_avg_sq.mul_(alpha_v)
+            v_min = exp_avg_sq.new_full((), 1e-12)
+            exp_avg_sq.mul_(alpha_v).add_(v_min * (1.0 - alpha_v))
         return optimizer_state
 
     def _project_onto_span(self, matrix: Tensor) -> Tensor:
@@ -373,6 +381,47 @@ class BSReLoRALayerState:
         delta = torch.matmul(x_proj, self.tilde_v @ core.transpose(0, 1))
         delta = torch.matmul(delta, self.tilde_u.transpose(0, 1))
         return output + delta.to(original_dtype)
+
+    def _adam_preconditioned_step(self, optimizer: torch.optim.Optimizer) -> Tensor:
+        state = optimizer.state.get(self.param)
+        if not state:
+            return torch.zeros_like(self.probe_accum)
+
+        group = None
+        for param_group in optimizer.param_groups:
+            for candidate in param_group["params"]:
+                if candidate is self.param:
+                    group = param_group
+                    break
+            if group is not None:
+                break
+        if group is None:
+            raise RuntimeError("Parameter not found in optimizer param groups")
+
+        exp_avg = state.get("exp_avg")
+        exp_avg_sq = state.get("exp_avg_sq")
+        step_t = state.get("step", 0)
+        if exp_avg is None or exp_avg_sq is None or exp_avg.numel() == 0:
+            return torch.zeros_like(self.probe_accum)
+
+        if isinstance(step_t, torch.Tensor):
+            step_val = int(step_t.item())
+        else:
+            step_val = int(step_t)
+        if step_val <= 0:
+            return torch.zeros_like(self.probe_accum)
+
+        beta1, beta2 = group.get("betas", (0.9, 0.999))
+        bias_correction1 = 1.0 - float(beta1) ** step_val
+        bias_correction2 = 1.0 - float(beta2) ** step_val
+        if bias_correction1 == 0.0 or bias_correction2 == 0.0:
+            return torch.zeros_like(self.probe_accum)
+
+        m_hat = exp_avg / bias_correction1
+        v_hat = exp_avg_sq / bias_correction2
+        denom = v_hat.sqrt().add_(group.get("eps", 1e-8))
+        step = group.get("lr", 1.0) * (m_hat / denom)
+        return step.to(torch.float32)
 
 
 def _interpolate_alpha(rho: float, limits: Tuple[float, float]) -> float:
@@ -435,9 +484,13 @@ class BSReLoRAController:
         for layer in self.layers:
             layer.store_snapshot()
 
-    def finish_step(self, capture: bool) -> None:
+    def finish_step(
+        self,
+        capture: bool,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+    ) -> None:
         for layer in self.layers:
-            layer.restore_and_accumulate(capture=capture)
+            layer.restore_and_accumulate(capture=capture, optimizer=optimizer)
 
     def finish_probe(self) -> None:
         for layer in self.layers:

@@ -1,0 +1,89 @@
+experiment:
+    name: dinov2-bs-relora
+    name_suffix: null
+    seed: 42
+    device: auto
+    output_dir: ./runs
+
+model:
+    name: dinov2_bs_relora
+    params:
+        model_name: facebook/dinov2-small
+        dropout: 0.0
+        freeze_backbone: false
+        gradient_checkpointing: false
+
+training:
+    epochs: 1
+    gradient_clip_norm: 1.0
+    grad_accumulation: 1
+    log_every: 20
+    eval_every: 1
+    save_every: 1
+    bs_relora:
+        enabled: true
+        rank: 8 # low-rank budget r
+        oversample: 4 # randomized SVD oversampling p
+        power_iterations: 1 # power iterations for SVD refinement
+        probe_steps: 32 # number of full batches in probe mode
+        low_rank_steps: 512 # batches spent in low-rank phase
+        cycles: 30 # repeat count for the schedule
+        lambda_u: 0.5 # soft deflation strength (left span)
+        lambda_v: 0.5 # soft deflation strength (right span)
+        gamma: 0.5 # momentum damping along new subspace
+        alpha_m_limits: [0.05, 0.4] # momentum shrink bounds
+        alpha_v_limits: [0.6, 0.9] # variance shrink bounds
+        rho_eps: 1.0e-12 # stabiliser for rho ratio
+        memory_rank_cap: 64 # cap on memory subspace width
+        eval_every: 2 # evaluate every X cycles
+        save_every: 10 # checkpoint every X cycles
+        target_modules: ["query", "key", "value", "dense"] # linear name filters
+        low_rank_optimizer:
+            type: adamw
+            lr: 0.003 # optimizer LR for adapter cores
+            weight_decay: 0.0
+            betas: [0.9, 0.999]
+            eps: 0.00000001
+    precision:
+        enabled: true
+        dtype: bf16
+        grad_scaler: false
+    optimizer:
+        type: adamw
+        lr: 0.0003
+        weight_decay: 0.05
+        betas: [0.9, 0.999]
+        eps: 0.00000001
+    scheduler:
+        type: cosine
+        warmup: 0.05
+        min_lr_mult: 0.1
+    monitor:
+        grad_norm: true
+        param_norm: true
+        memory: true
+
+data:
+    root: /speedy/datasets
+    image_size: 224
+    batch_size: 64
+    num_workers: 8
+    pin_memory: true
+    persistent_workers: true
+    normalization: imagenet
+    augment: true
+    drop_last: true
+
+logging:
+    use_wandb: true
+    project: Burst-ReLoRA
+    entity: null
+    run_name: null
+    group: null
+    tags: ["dinov2", "bs-relora"]
+    notes: null
+
+datasets:
+    - name: ImageNet
+      val_split: test
+      normalization: dinov2

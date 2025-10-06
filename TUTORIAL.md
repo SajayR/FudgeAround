@@ -53,14 +53,43 @@ This repo is intentionally tiny so you can swap architectures, datasets, and log
      params:
        width: 128
        dropout: 0.2
-   ```
-   Any key in `params` is passed to your builder.
+  ```
+  Any key in `params` is passed to your builder.
+
+- Need a live example? See `models/dinov2_bs_relora.py` plus the matching
+  `configs/dinov2_bs_relora.yaml` for a Dinov2 classifier wired for the
+  BS-ReLoRA training loop.
 
 ## 3. Running Training
 
 ```bash
 python train.py --config configs/default.yaml
 ```
+
+### BS-ReLoRA cycles
+
+With the default config the trainer runs BS-ReLoRA cycles instead of plain
+epochs. Each cycle consists of a 32-step **probe** (freeze linear weights but
+update Adam moments), SVD-based **subspace extraction** with soft deflation,
+a 128-step **low-rank** phase that only optimises the LoRA cores, and a final
+**merge** that folds the low-rank update into the base weights while damping
+optimizer state.
+
+Tweak the behaviour in `training.bs_relora`:
+
+```yaml
+training:
+  bs_relora:
+    enabled: true
+    rank: 16
+    oversample: 4
+    probe_steps: 32
+    low_rank_steps: 128
+    cycles: 3
+    target_modules: ["query", "key", "value", "dense"]
+```
+
+Set `enabled: false` to fall back to classic epoch-based training.
 
 Common tweaks:
 

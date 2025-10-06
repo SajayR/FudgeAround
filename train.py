@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import logging
 import re
@@ -34,6 +35,7 @@ from utils.training_utils import (
     set_seed,
     setup_logging,
 )
+from utils.bs_relora import BSReLoRAConfig, BSReLoRAController
 import os
 
 os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
@@ -388,6 +390,406 @@ def evaluate(
     }
 
 
+def _infinite_loader(loader):
+    """Yield batches from ``loader`` indefinitely without caching the dataset."""
+
+    while True:
+        for batch in loader:
+            yield batch
+
+
+def _select_bs_relora_layers(model: nn.Module, keywords: Iterable[str]) -> List[tuple[str, nn.Linear]]:
+    lowered = [kw.lower() for kw in (keywords or []) if kw]
+    matches: List[tuple[str, nn.Linear]] = []
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            if not lowered or any(key in name.lower() for key in lowered):
+                matches.append((name, module))
+    return matches
+
+
+def _create_low_rank_optimizer(params: List[nn.Parameter], cfg: Dict[str, any]):
+    parameters = [p for p in params if p.requires_grad]
+    if not parameters:
+        return None
+    name = (cfg or {}).get("type", "adamw").lower()
+    lr = float(cfg.get("lr", 1e-3))
+    weight_decay = float(cfg.get("weight_decay", 0.0))
+    betas = tuple(cfg.get("betas", (0.9, 0.999)))
+    eps = float(cfg.get("eps", 1e-8))
+
+    if name == "adamw":
+        optimizer = torch.optim.AdamW(parameters, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+    elif name == "adam":
+        optimizer = torch.optim.Adam(parameters, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"Unsupported low-rank optimizer: {name}")
+    return optimizer
+
+
+def _run_bs_relora_phase(
+    phase_name: str,
+    num_steps: int,
+    model: nn.Module,
+    controller: BSReLoRAController,
+    batch_iter,
+    device: torch.device,
+    base_optimizer: torch.optim.Optimizer,
+    low_rank_optimizer: torch.optim.Optimizer | None,
+    scheduler,
+    scaler: GradScaler,
+    precision_cfg: Dict[str, any],
+    monitor_cfg: Dict[str, any],
+    grad_accum: int,
+    log_every: int,
+    run_logger: RunLogger,
+    global_step: int,
+    capture_probe: bool,
+) -> tuple[Dict[str, float], int]:
+    """Run one BS-ReLoRA phase (probe or low-rank)."""
+
+    model.train()
+    criterion = nn.CrossEntropyLoss()
+
+    use_amp = precision_cfg.get("enabled", True) and device.type == "cuda"
+    dtype = precision_cfg.get("dtype", "bf16").lower()
+    amp_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
+
+    total_loss = 0.0
+    total_samples = 0
+    running_top1 = 0.0
+    running_top5 = 0.0
+    start = time.time()
+
+    grad_clip = precision_cfg.get("grad_clip", None)
+
+    total_micro_steps = num_steps * max(grad_accum, 1)
+    progress = tqdm(range(total_micro_steps), desc=f"{phase_name.capitalize()} phase", leave=False)
+
+    for micro_idx in progress:
+        images, targets = next(batch_iter)
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        with autocast(enabled=use_amp, dtype=amp_dtype, device_type="cuda"):
+            outputs = model(images)
+            loss = criterion(outputs, targets) / grad_accum
+
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        should_step = ((micro_idx + 1) % grad_accum == 0)
+        samples = targets.size(0)
+        batch_loss = loss.item() * grad_accum * samples
+        total_loss += batch_loss
+        total_samples += samples
+        running_top1 += accuracy(outputs.detach(), targets.detach()) * samples
+        running_top5 += top_k_accuracy(outputs.detach(), targets.detach(), 5) * samples
+
+        avg_loss = total_loss / max(total_samples, 1)
+        avg_top1 = running_top1 / max(total_samples, 1)
+        avg_top5 = running_top5 / max(total_samples, 1)
+        progress.set_postfix(loss=f"{avg_loss:.4f}", top1=f"{avg_top1:.2f}", top5=f"{avg_top5:.2f}")
+
+        if not should_step:
+            continue
+
+        if capture_probe:
+            controller.prepare_step()
+
+        if scaler.is_enabled():
+            scaler.unscale_(base_optimizer)
+            if low_rank_optimizer is not None:
+                scaler.unscale_(low_rank_optimizer)
+
+        grad_norm_value = None
+        if monitor_cfg.get("grad_norm", True):
+            grad_norm_value = grad_norm(model.parameters())
+
+        adapter_grad_norm = None
+        adapter_param_norm = None
+        if not capture_probe:
+            adapter_grad_norm = controller.adapter_grad_norm()
+            adapter_param_norm = controller.adapter_param_norm()
+
+        if grad_clip:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+        if scaler.is_enabled():
+            if capture_probe:
+                scaler.step(base_optimizer)
+            if low_rank_optimizer is not None:
+                scaler.step(low_rank_optimizer)
+            scaler.update()
+        else:
+            if capture_probe:
+                base_optimizer.step()
+            if low_rank_optimizer is not None:
+                low_rank_optimizer.step()
+
+        if capture_probe:
+            controller.finish_step(capture=True)
+
+        base_optimizer.zero_grad(set_to_none=True)
+        if low_rank_optimizer is not None:
+            low_rank_optimizer.zero_grad(set_to_none=True)
+        if scheduler is not None and capture_probe:
+            scheduler.step()
+
+        global_step += 1
+
+        metrics = {
+            f"{phase_name}/loss_step": float(batch_loss / max(samples, 1)),
+        }
+        if capture_probe:
+            metrics["train/lr"] = base_optimizer.param_groups[0]["lr"]
+        elif low_rank_optimizer is not None:
+            metrics["lowrank/lr"] = low_rank_optimizer.param_groups[0]["lr"]
+        if grad_norm_value is not None:
+            metrics[f"{phase_name}/grad_norm"] = grad_norm_value
+        if monitor_cfg.get("param_norm", False):
+            metrics[f"{phase_name}/param_norm"] = param_norm(model.parameters())
+        if adapter_param_norm is not None:
+            metrics["lowrank/adapter_param_norm"] = adapter_param_norm
+        if adapter_grad_norm is not None:
+            metrics["lowrank/adapter_grad_norm"] = adapter_grad_norm
+        if monitor_cfg.get("memory", False) and torch.cuda.is_available():
+            metrics[f"{phase_name}/memory_gb"] = torch.cuda.memory_allocated() / 1e9
+        if log_every and global_step % log_every == 0:
+            run_logger.log(metrics, step=global_step)
+
+    duration = time.time() - start
+    phase_metrics = {
+        f"{phase_name}/loss": total_loss / max(total_samples, 1),
+        f"{phase_name}/top1": running_top1 / max(total_samples, 1),
+        f"{phase_name}/top5": running_top5 / max(total_samples, 1),
+        f"{phase_name}/samples": total_samples,
+        f"{phase_name}/duration": duration,
+        f"{phase_name}/throughput": total_samples / max(duration, 1e-9),
+        f"{phase_name}/optimizer_steps": num_steps,
+    }
+    return phase_metrics, global_step
+
+
+def _train_with_bs_relora(
+    model: nn.Module,
+    train_loader,
+    val_loader,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    scaler: GradScaler,
+    device: torch.device,
+    precision_cfg: Dict[str, any],
+    monitor_cfg: Dict[str, any],
+    training_cfg: Dict[str, any],
+    bs_cfg: Dict[str, any],
+    model_name: str,
+    model_params: Dict[str, any],
+    model_meta: Dict[str, any],
+    dataset_info,
+    run_logger: RunLogger,
+    run_dir: Path,
+    config: Dict[str, any],
+) -> Dict[str, float]:
+    LOGGER.info("Running BS-ReLoRA training")
+    grad_accum = max(
+        1,
+        int(
+            training_cfg.get("grad_accumulation", training_cfg.get("grad_accum", 1))
+        ),
+    )
+    log_every = int(training_cfg.get("log_every", 10))
+    cycles = max(1, int(bs_cfg.get("cycles", 1)))
+    probe_steps = max(1, int(bs_cfg.get("probe_steps", 32)))
+    low_rank_steps = max(1, int(bs_cfg.get("low_rank_steps", 128)))
+    eval_every = int(bs_cfg.get("eval_every", training_cfg.get("eval_every", 1)))
+    save_every = int(bs_cfg.get("save_every", training_cfg.get("save_every", 1)))
+
+    lora_defaults = model_params.get("lora", {}) if isinstance(model_params.get("lora", {}), dict) else {}
+    target_modules = bs_cfg.get("target_modules") or lora_defaults.get("target_modules") or []
+    layer_selector = _select_bs_relora_layers(model, target_modules)
+    if not layer_selector:
+        raise RuntimeError(
+            "BS-ReLoRA is enabled but no target nn.Linear modules were located. "
+            "Provide `training.bs_relora.target_modules` or ensure the model exposes linear layers."
+        )
+
+    rank_default = lora_defaults.get("r") or lora_defaults.get("rank") or 16
+    rank = int(bs_cfg.get("rank", bs_cfg.get("r", rank_default)))
+    oversample = int(bs_cfg.get("oversample", bs_cfg.get("p", 4)))
+    power_iterations = int(bs_cfg.get("power_iterations", 1))
+    memory_cap = int(
+        bs_cfg.get(
+            "memory_rank_cap",
+            bs_cfg.get("memory_max_rank", rank * int(bs_cfg.get("memory_cycles", 4))),
+        )
+    )
+    lambda_u = float(bs_cfg.get("lambda_u", 0.5))
+    lambda_v = float(bs_cfg.get("lambda_v", 0.5))
+    gamma = float(bs_cfg.get("gamma", 0.5))
+    alpha_m_limits = tuple(bs_cfg.get("alpha_m_limits", (0.05, 0.5)))
+    alpha_v_limits = tuple(bs_cfg.get("alpha_v_limits", (0.5, 0.9)))
+    if len(alpha_m_limits) != 2 or len(alpha_v_limits) != 2:
+        raise ValueError("alpha*_limits must be sequences of length 2")
+    rho_eps = float(bs_cfg.get("rho_eps", 1e-12))
+
+    relora_config = BSReLoRAConfig(
+        rank=rank,
+        oversample=oversample,
+        power_iterations=power_iterations,
+        probe_steps=probe_steps,
+        low_rank_steps=low_rank_steps,
+        memory_rank_cap=memory_cap,
+        lambda_u=lambda_u,
+        lambda_v=lambda_v,
+        gamma=gamma,
+        alpha_m_limits=(float(alpha_m_limits[0]), float(alpha_m_limits[1])),
+        alpha_v_limits=(float(alpha_v_limits[0]), float(alpha_v_limits[1])),
+        rho_eps=rho_eps,
+    )
+
+    controller = BSReLoRAController(model, layer_selector, relora_config)
+    LOGGER.info(
+        "BS-ReLoRA targeting %d linear layers: %s",
+        len(controller.layer_names()),
+        controller.layer_names(),
+    )
+
+    batch_iter = _infinite_loader(train_loader)
+    low_rank_opt_cfg = bs_cfg.get("low_rank_optimizer", {})
+
+    best_metric = None
+    best_path = None
+    global_step = 0
+
+    checkpoints_dir = run_dir / "checkpoints"
+
+    for cycle in range(cycles):
+        LOGGER.info("Cycle %d/%d - probe phase", cycle + 1, cycles)
+        controller.start_probe()
+        probe_metrics, global_step = _run_bs_relora_phase(
+            phase_name="probe",
+            num_steps=probe_steps,
+            model=model,
+            controller=controller,
+            batch_iter=batch_iter,
+            device=device,
+            base_optimizer=optimizer,
+            low_rank_optimizer=None,
+            scheduler=scheduler,
+            scaler=scaler,
+            precision_cfg=precision_cfg,
+            monitor_cfg=monitor_cfg,
+            grad_accum=grad_accum,
+            log_every=log_every,
+            run_logger=run_logger,
+            global_step=global_step,
+            capture_probe=True,
+        )
+        controller.finish_probe()
+        controller.extract_subspaces()
+        controller.activate_low_rank()
+        controller.set_base_trainable(False)
+
+        low_rank_optimizer = _create_low_rank_optimizer(controller.adapter_parameters(), low_rank_opt_cfg)
+
+        LOGGER.info("Cycle %d/%d - low-rank phase", cycle + 1, cycles)
+        low_metrics, global_step = _run_bs_relora_phase(
+            phase_name="lowrank",
+            num_steps=low_rank_steps,
+            model=model,
+            controller=controller,
+            batch_iter=batch_iter,
+            device=device,
+            base_optimizer=optimizer,
+            low_rank_optimizer=low_rank_optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            precision_cfg=precision_cfg,
+            monitor_cfg=monitor_cfg,
+            grad_accum=grad_accum,
+            log_every=log_every,
+            run_logger=run_logger,
+            global_step=global_step,
+            capture_probe=False,
+        )
+
+        merge_metrics = controller.merge_and_damp(optimizer)
+        controller.restore_original_requires_grad()
+        controller.deactivate_low_rank()
+
+        cycle_metrics = {**probe_metrics, **low_metrics, **merge_metrics, "cycle": cycle}
+        run_logger.log(cycle_metrics, step=global_step)
+
+        should_eval = (cycle + 1) % max(eval_every, 1) == 0 or (cycle + 1) == cycles
+        val_metrics: Dict[str, float] = {}
+        if should_eval:
+            LOGGER.info("Evaluating after cycle %d", cycle + 1)
+            val_metrics = evaluate(model, val_loader, device, precision_cfg)
+            run_logger.log(val_metrics, step=global_step)
+            metric_value = val_metrics.get("val/accuracy")
+            if metric_value is not None:
+                is_best = best_metric is None or metric_value > best_metric
+                if is_best:
+                    best_metric = metric_value
+                    best_path = checkpoints_dir / "best.pt"
+                    save_checkpoint(
+                        {
+                            "cycle": cycle,
+                            "global_step": global_step,
+                            "model_state": model.state_dict(),
+                            "optimizer_state": optimizer.state_dict(),
+                            "scheduler_state": scheduler.state_dict() if scheduler else None,
+                            "metrics": {**cycle_metrics, **val_metrics},
+                            "dataset": dataset_info.__dict__,
+                            "model": {
+                                "name": model_name,
+                                "params": model_params,
+                                "meta": model_meta,
+                            },
+                            "config": config,
+                        },
+                        best_path,
+                    )
+
+        if (cycle + 1) % max(save_every, 1) == 0:
+            ckpt_path = checkpoints_dir / f"cycle_{cycle + 1:03d}.pt"
+            save_checkpoint(
+                {
+                    "cycle": cycle,
+                    "global_step": global_step,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "scheduler_state": scheduler.state_dict() if scheduler else None,
+                    "metrics": {**cycle_metrics, **val_metrics},
+                    "dataset": dataset_info.__dict__,
+                    "model": {
+                        "name": model_name,
+                        "params": model_params,
+                        "meta": model_meta,
+                    },
+                    "config": config,
+                },
+                ckpt_path,
+            )
+
+    summary = {
+        "best/val_accuracy": best_metric,
+        "cycles": cycles,
+        "probe_steps": probe_steps,
+        "low_rank_steps": low_rank_steps,
+        "global_step": global_step,
+        "dataset/train_samples": dataset_info.train_samples,
+        "dataset/val_samples": dataset_info.val_samples,
+        "dataset/classes": dataset_info.num_classes,
+    }
+    if best_path is not None:
+        summary["best_checkpoint"] = str(best_path)
+    return summary
+
+
 def run_dataset(
     config: Dict[str, any], spec: DatasetSpec, device: torch.device
 ) -> Dict[str, float]:
@@ -443,7 +845,16 @@ def run_dataset(
         model.to(device)
 
         optimizer = create_optimizer(model, training_cfg.get("optimizer", {}))
-        total_steps = len(train_loader) * max(int(training_cfg.get("epochs", 1)), 1)
+        bs_cfg = training_cfg.get("bs_relora", {}) or {}
+        bs_enabled = bool(bs_cfg.get("enabled", False))
+        if bs_enabled:
+            probe_steps_conf = max(1, int(bs_cfg.get("probe_steps", 32)))
+            low_rank_steps_conf = max(1, int(bs_cfg.get("low_rank_steps", 128)))
+            cycles_conf = max(1, int(bs_cfg.get("cycles", 1)))
+            total_steps = max(1, cycles_conf * (probe_steps_conf + low_rank_steps_conf))
+        else:
+            total_steps = len(train_loader) * max(int(training_cfg.get("epochs", 1)), 1)
+
         scheduler = create_scheduler(
             optimizer, training_cfg.get("scheduler", {}), total_steps
         )
@@ -464,6 +875,30 @@ def run_dataset(
             and precision_cfg.get("dtype", "bf16").lower() == "fp16"
             and precision_cfg.get("grad_scaler", True)
         )
+
+        if bs_enabled:
+            summary = _train_with_bs_relora(
+                model=model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                device=device,
+                precision_cfg=precision_cfg,
+                monitor_cfg=monitor_cfg,
+                training_cfg=training_cfg,
+                bs_cfg=bs_cfg,
+                model_name=model_name,
+                model_params=model_params,
+                model_meta=model_meta,
+                dataset_info=dataset_info,
+                run_logger=run_logger,
+                run_dir=run_dir,
+                config=config,
+            )
+            run_logger.summary(summary)
+            return summary
 
         best_metric = None
         best_path = None

@@ -25,6 +25,30 @@ training:
   log_every: 20
   eval_every: 1
   save_every: 1
+  bs_relora:
+    enabled: true
+    rank: 16                # low-rank budget r
+    oversample: 4           # randomized SVD oversampling p
+    power_iterations: 1     # power iters for better spectrum capture
+    probe_steps: 32         # K full batches for probe phase
+    low_rank_steps: 128     # N batches for low-rank updates
+    cycles: 3               # number of (probe + low-rank) repeats
+    lambda_u: 0.5           # soft deflation strength (left span)
+    lambda_v: 0.5           # soft deflation strength (right span)
+    gamma: 0.5              # momentum damp along new span
+    alpha_m_limits: [0.05, 0.4]  # momentum shrink bounds
+    alpha_v_limits: [0.6, 0.9]   # variance shrink bounds
+    rho_eps: 1.0e-12        # stability eps in rho computation
+    memory_rank_cap: 64     # cap memory subspace width
+    eval_every: 1           # evaluate every X cycles
+    save_every: 1           # checkpoint every X cycles
+    target_modules: ["query", "key", "value", "dense"]  # layer name filters
+    low_rank_optimizer:
+      type: adamw
+      lr: 0.001             # LR for adapter cores
+      weight_decay: 0.0
+      betas: [0.9, 0.999]
+      eps: 0.00000001
   precision:
     enabled: true
     dtype: bf16

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, Iterable
 
 import torch
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from tqdm import tqdm
 
 from configs import load_config
@@ -67,13 +67,12 @@ def get_device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def evaluate(model, loader, device: torch.device, precision_cfg: Dict[str, any]) -> Dict[str, float]:
+def evaluate(model, loader, device: torch.device) -> Dict[str, float]:
     model.eval()
     criterion = torch.nn.CrossEntropyLoss()
 
-    use_amp = precision_cfg.get("enabled", True) and device.type == "cuda"
-    dtype = precision_cfg.get("dtype", "bf16").lower()
-    amp_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
+    use_amp = device.type == "cuda"
+    amp_dtype = torch.bfloat16
 
     total_loss = 0.0
     total_samples = 0
@@ -85,7 +84,7 @@ def evaluate(model, loader, device: torch.device, precision_cfg: Dict[str, any])
         for images, targets in progress:
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
-            with autocast(enabled=use_amp, dtype=amp_dtype):
+            with autocast(enabled=use_amp, dtype=amp_dtype, device_type="cuda"):
                 outputs = model(images)
                 loss = criterion(outputs, targets)
 
@@ -135,7 +134,7 @@ def main(argv: Iterable[str] | None = None) -> None:
     model.load_state_dict(state["model_state"])
     LOGGER.info("Loaded checkpoint from %s (epoch=%s)", checkpoint_path, state.get("epoch"))
 
-    metrics = evaluate(model, val_loader, device, config.get("training", {}).get("precision", {}))
+    metrics = evaluate(model, val_loader, device)
     LOGGER.info("Metrics: %s", metrics)
     print(metrics)
 

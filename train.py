@@ -13,7 +13,7 @@ from typing import Dict, Iterable, List
 
 import torch
 import torch.nn as nn
-from torch.amp import GradScaler, autocast
+from torch.amp import autocast
 from tqdm import tqdm
 
 try:
@@ -239,12 +239,11 @@ def train_epoch(
     loader,
     optimizer,
     scheduler,
-    scaler: GradScaler,
     device: torch.device,
     epoch: int,
     epochs: int,
     grad_accum: int,
-    precision_cfg: Dict[str, any],
+    grad_clip: float | None,
     monitor_cfg: Dict[str, any],
     global_step: int,
     log_every: int,
@@ -253,9 +252,8 @@ def train_epoch(
     model.train()
     criterion = nn.CrossEntropyLoss()
 
-    use_amp = precision_cfg.get("enabled", True) and device.type == "cuda"
-    dtype = precision_cfg.get("dtype", "bf16").lower()
-    amp_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
+    use_amp = device.type == "cuda"
+    amp_dtype = torch.bfloat16
 
     total_loss = 0.0
     total_samples = 0
@@ -274,24 +272,17 @@ def train_epoch(
             outputs = model(images)
             loss = criterion(outputs, targets) / grad_accum
 
-        scaler.scale(loss).backward() if scaler.is_enabled() else loss.backward()
+        loss.backward()
 
         should_step = (step + 1) % grad_accum == 0
         if should_step:
-            if scaler.is_enabled():
-                scaler.unscale_(optimizer)
             if monitor_cfg.get("grad_norm", True):
                 gn = grad_norm(model.parameters())
             else:
                 gn = None
-            clip_val = precision_cfg.get("grad_clip", None)
-            if clip_val:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_val)
-            if scaler.is_enabled():
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             if scheduler is not None:
                 scheduler.step()
@@ -340,14 +331,13 @@ def train_epoch(
 
 @torch.no_grad()
 def evaluate(
-    model: nn.Module, loader, device: torch.device, precision_cfg: Dict[str, any]
+    model: nn.Module, loader, device: torch.device
 ) -> Dict[str, float]:
     model.eval()
     criterion = nn.CrossEntropyLoss()
 
-    use_amp = precision_cfg.get("enabled", True) and device.type == "cuda"
-    dtype = precision_cfg.get("dtype", "bf16").lower()
-    amp_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
+    use_amp = device.type == "cuda"
+    amp_dtype = torch.bfloat16
 
     total_loss = 0.0
     total_samples = 0
@@ -448,22 +438,13 @@ def run_dataset(
             optimizer, training_cfg.get("scheduler", {}), total_steps
         )
 
-        precision_cfg = training_cfg.get(
-            "precision", {"enabled": True, "dtype": "bf16", "grad_scaler": False}
-        )
-        precision_cfg.setdefault("grad_clip", training_cfg.get("gradient_clip_norm"))
         grad_accum = max(
             1,
             int(
                 training_cfg.get("grad_accumulation", training_cfg.get("grad_accum", 1))
             ),
         )
-        scaler = GradScaler(
-            enabled=precision_cfg.get("enabled", True)
-            and device.type == "cuda"
-            and precision_cfg.get("dtype", "bf16").lower() == "fp16"
-            and precision_cfg.get("grad_scaler", True)
-        )
+        grad_clip = training_cfg.get("gradient_clip_norm")
 
         best_metric = None
         best_path = None
@@ -480,12 +461,11 @@ def run_dataset(
                 train_loader,
                 optimizer,
                 scheduler,
-                scaler,
                 device,
                 epoch,
                 epochs,
                 grad_accum,
-                precision_cfg,
+                grad_clip,
                 monitor_cfg,
                 global_step,
                 log_every,
@@ -494,7 +474,7 @@ def run_dataset(
             global_step = int(epoch_metrics["state/global_step"])
 
             if (epoch + 1) % eval_every == 0 or (epoch + 1) == epochs:
-                val_metrics = evaluate(model, val_loader, device, precision_cfg)
+                val_metrics = evaluate(model, val_loader, device)
                 run_logger.log(val_metrics, step=global_step)
             else:
                 val_metrics = {}

@@ -1,22 +1,25 @@
 experiment:
-    name: dinov2-baseline
-    name_suffix: null
+    name: dinov2-twinlora
+    name_suffix: twinlora-rank-8
     seed: 42
     device: auto
     output_dir: ./runs
 
 model:
-    name: dinov2_lora
+    name: dinov2_twinlora
     params:
         model_name: facebook/dinov2-small
         dropout: 0.1
-        freeze_backbone: false
-        lora:
+        freeze_backbone: true
+        twinlora:
             enabled: true
-            r: 8
-            alpha: 16
-            dropout: 0.0
-            target_modules: ["dense", "fc1", "fc2"] #["query", "key", "value", "dense"]
+            rank: 8 # LoRA rank r
+            shared_rank: 4 # Twin rank s
+            alpha: 8.0 # => scaling = 1.0 for LoRA
+            twin_alpha: 4.0 # => scaling = 1.0 for Twin
+            dropout: 0.05 # light reg on LoRA path
+            twin_dropout: 0.0
+            init: kaiming
 
 training:
     epochs: 5
@@ -57,7 +60,7 @@ logging:
     entity: null
     run_name: null
     group: null
-    tags: ["dinov2", "baseline"]
+    tags: ["dinov2", "twinlora"]
     notes: null
 
 datasets:

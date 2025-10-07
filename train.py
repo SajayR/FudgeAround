@@ -290,8 +290,8 @@ def train_epoch(
             global_step += 1
 
             metrics = {
-                "train/loss_step": float(loss.item() * grad_accum),
-                "train/lr": optimizer.param_groups[0]["lr"],
+                "train/loss": float(loss.item() * grad_accum),
+                "train/learning_rate": optimizer.param_groups[0]["lr"],
             }
             if monitor_cfg.get("grad_norm", True) and gn is not None:
                 metrics["train/grad_norm"] = gn
@@ -330,9 +330,7 @@ def train_epoch(
 
 
 @torch.no_grad()
-def evaluate(
-    model: nn.Module, loader, device: torch.device
-) -> Dict[str, float]:
+def evaluate(model: nn.Module, loader, device: torch.device) -> Dict[str, float]:
     model.eval()
     criterion = nn.CrossEntropyLoss()
 

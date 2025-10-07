@@ -39,6 +39,15 @@ def _build_dinov2(params: Dict[str, Any], dataset: DatasetInfo):
     return model, extras
 
 
+@register("dinov2_twinlora")
+def _build_dinov2_twin(params: Dict[str, Any], dataset: DatasetInfo):
+    from .dinov2_twinlora import build_model
+
+    model_name = params.get("model_name", "facebook/dinov2-small")
+    model, extras = build_model(model_name, dataset.num_classes, params)
+    return model, extras
+
+
 @register("vit_base_lora")
 def _build_vit_base(params: Dict[str, Any], dataset: DatasetInfo):
     from .vit_base_lora import build_model

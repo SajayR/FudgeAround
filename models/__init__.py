@@ -48,6 +48,15 @@ def _build_dinov2_twin(params: Dict[str, Any], dataset: DatasetInfo):
     return model, extras
 
 
+@register("dinov2_combotwinlora")
+def _build_dinov2_combo(params: Dict[str, Any], dataset: DatasetInfo):
+    from .dinov2_combotwinlora import build_model
+
+    model_name = params.get("model_name", "facebook/dinov2-small")
+    model, extras = build_model(model_name, dataset.num_classes, params)
+    return model, extras
+
+
 @register("vit_base_lora")
 def _build_vit_base(params: Dict[str, Any], dataset: DatasetInfo):
     from .vit_base_lora import build_model

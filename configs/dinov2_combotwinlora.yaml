@@ -1,22 +1,30 @@
 experiment:
-    name: dinov2-baseline
-    name_suffix: null
+    name: dinov2-combo-twinlora
+    name_suffix: combo-twinlora-rank-8
     seed: 42
     device: auto
     output_dir: ./runs
 
 model:
-    name: dinov2_lora
+    name: dinov2_combotwinlora
     params:
         model_name: facebook/dinov2-small
         dropout: 0.0
-        freeze_backbone: false
+        freeze_backbone: true
         lora:
             enabled: true
-            r: 10
-            alpha: 20
-            dropout: 0.0
-            target_modules: ["dense", "fc1", "fc2", "query", "key", "value"]
+            r: 12
+            alpha: 24
+            dropout: 0.00
+            target_modules: ["query", "key", "value", "dense"]
+        twinlora:
+            enabled: true
+            rank: 8
+            shared_rank: 4
+            alpha: 8.0
+            twin_alpha: 4.0
+            dropout: 0.00
+            twin_dropout: 0.0
 
 training:
     epochs: 10
@@ -57,7 +65,7 @@ logging:
     entity: null
     run_name: null
     group: null
-    tags: ["dinov2", "baseline"]
+    tags: ["dinov2", "combo", "twinlora"]
     notes: null
 
 datasets:

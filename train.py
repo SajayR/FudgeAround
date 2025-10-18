@@ -430,6 +430,17 @@ def run_dataset(
         model, model_meta = create_model(model_name, model_params, dataset_info)
         model.to(device)
 
+        # Log every trainable tensor explicitly so it's clear what will update.
+        trainable_tensors = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
+        total_trainable = sum(param.numel() for _, param in trainable_tensors)
+        LOGGER.info(
+            "Trainable tensors: %d (%.2f M parameters)",
+            len(trainable_tensors),
+            total_trainable / 1e6,
+        )
+        for name, param in trainable_tensors:
+            LOGGER.info("  %s | shape=%s | params=%d", name, tuple(param.shape), param.numel())
+
         optimizer = create_optimizer(model, training_cfg.get("optimizer", {}))
         total_steps = len(train_loader) * max(int(training_cfg.get("epochs", 1)), 1)
         scheduler = create_scheduler(

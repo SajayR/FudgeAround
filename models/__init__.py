@@ -48,4 +48,13 @@ def _build_vit_base(params: Dict[str, Any], dataset: DatasetInfo):
     return model, extras
 
 
+@register("dinov2_randominit")
+def _build_dinov2_random(params: Dict[str, Any], dataset: DatasetInfo):
+    from .dinov2_randominit import build_model
+
+    model_name = params.get("model_name", "facebook/dinov2-small")
+    model, extras = build_model(model_name, dataset.num_classes, params)
+    return model, extras
+
+
 __all__ = ["create", "register"]

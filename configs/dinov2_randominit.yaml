@@ -1,0 +1,71 @@
+experiment:
+  name: dinov2-random-init-adamw
+  name_suffix: null
+  seed: 42
+  device: auto
+  output_dir: ./runs
+
+model:
+  name: dinov2_randominit
+  params:
+    model_name: facebook/dinov2-small
+    dropout: 0.1
+    freeze_backbone: false
+    gradient_checkpointing: false
+
+training:
+  epochs: 10
+  gradient_clip_norm: 1.0
+  grad_accumulation: 1
+  log_every: 1
+  eval_every: 1
+  save_every: 1
+  precision:
+    enabled: true
+    dtype: bf16
+    grad_scaler: false
+  optimizer:
+    type: adamw
+    lr: 0.0003
+    weight_decay: 0.05
+    betas: [0.9, 0.999]
+    eps: 0.00000001
+  scheduler:
+    type: cosine
+    warmup: 0.1
+    min_lr_mult: 0.1
+  monitor:
+    grad_norm: true
+    param_norm: true
+    memory: true
+
+data:
+  root: /speedy/datasets
+  image_size: 224
+  batch_size: 128
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  normalization: imagenet
+  augment: true
+  drop_last: true
+
+logging:
+  use_wandb: true
+  project: cis-testbed-optimizers
+  entity: null
+  run_name: null
+  group: null
+  tags: ["dinov2", "random-init"]
+  notes: null
+
+datasets:
+  - name: cifar-10
+    val_split: test
+    normalization: cifar10
+  - name: flowers-102
+    val_split: test
+    normalization: vit
+  - name: cifar-100
+    val_split: test
+    normalization: vit
